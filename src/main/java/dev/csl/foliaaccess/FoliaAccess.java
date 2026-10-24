@@ -6,6 +6,7 @@ import io.papermc.paper.plugin.loader.library.impl.JarLibrary;
 import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.Exclusion;
 import org.eclipse.aether.repository.RemoteRepository;
+import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.net.JarURLConnection;
@@ -234,15 +235,17 @@ public final class FoliaAccess {
         Class<?> type = null;
         try {
             // The parent is the plugin's own PaperPluginClassLoader (this class
-            // is loaded by it in the bootstrap phase). Reaching the server and
-            // other plugins goes through it and its classloader group, so the
-            // exact parent matters less than it would if AccessClassLoader had to
-            // register for visibility itself.
+            // is loaded by it in the bootstrap phase). Reuse its dependency
+            // access policy for AccessClassLoader before loading the main class;
+            // Paper then sees it registered and does not use its unsafe fallback.
             loader = new AccessClassLoader(
                     urls.toArray(new URL[0]),
                     FoliaAccess.class.getClassLoader(),
                     context.getConfiguration(),
                     context.getPluginSource());
+            if (loader.getParent() instanceof ConfiguredPluginClassLoader) {
+                loader.registerAccessBackedGroup();
+            }
 
             String main = context.getConfiguration().getMainClass();
             type = Class.forName(main, true, loader);
@@ -263,7 +266,19 @@ public final class FoliaAccess {
                 throw new IllegalStateException(main + " is not a JavaPlugin");
             }
             return (JavaPlugin) type.getDeclaredConstructor().newInstance();
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            if (loader != null) {
+                try {
+                    loader.close();
+                } catch (Exception closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                try {
+                    loader.unregisterFromPaper();
+                } catch (Exception unregisterFailure) {
+                    e.addSuppressed(unregisterFailure);
+                }
+            }
             throw new IllegalStateException("FoliaAccess failed to start " + name
                     + (type == null ? "" : "\n" + diagnose(type, loader)), e);
         }

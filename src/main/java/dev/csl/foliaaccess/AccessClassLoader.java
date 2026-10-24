@@ -2,7 +2,9 @@ package dev.csl.foliaaccess;
 
 import com.destroystokyo.paper.utils.PaperPluginLogger;
 import io.papermc.paper.plugin.configuration.PluginMeta;
+import io.papermc.paper.plugin.provider.classloader.ClassLoaderAccess;
 import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
+import io.papermc.paper.plugin.provider.classloader.PaperClassLoaderStorage;
 import io.papermc.paper.plugin.provider.classloader.PluginClassLoaderGroup;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.PluginDescriptionFile;
@@ -48,14 +50,12 @@ import java.util.Set;
  * whatever a server actually provides (Purpur classes on Leaf, a library the
  * server bundles, a class it stops bundling).
  *
- * <h2>Seeing other plugins</h2>
- * Not by registering this loader anywhere. The parent is a
- * {@code ConfiguredPluginClassLoader} with a {@link PluginClassLoaderGroup}, and
- * delegating to {@code parent.loadClass} reaches that group, which resolves
- * declared plugin dependencies. So ViaVersion is visible because it is declared
- * with {@code join-classpath}, not because this loader grabbed a second,
- * broader group. This loader is an implementation detail of the plugin, not a
- * peer, and is deliberately absent from Paper's classloader storage.
+ * <h2>Plugin visibility</h2>
+ * Before loading the main class, FoliaAccess registers this loader with
+ * {@code PaperClassLoaderStorage.registerAccessBackedGroup}, reusing the
+ * parent's access policy. That gives the library loader the same dependency
+ * visibility as its plugin, while Paper's registration also prevents the later
+ * unsafe-registration fallback and warning.
  *
  * <h2>Why it implements {@link ConfiguredPluginClassLoader}</h2>
  * {@code JavaPlugin}'s constructor requires it:
@@ -80,6 +80,8 @@ final class AccessClassLoader extends URLClassLoader implements ConfiguredPlugin
     private final Path source;
     private final Set<Path> ownJars;
     private final ClassLoader parent;
+    /** The access-backed group returned by Paper when this loader is registered. */
+    private volatile PluginClassLoaderGroup group;
     /** Set by {@link #init}, which {@code JavaPlugin}'s constructor calls. */
     private volatile JavaPlugin plugin;
 
@@ -97,6 +99,44 @@ final class AccessClassLoader extends URLClassLoader implements ConfiguredPlugin
             }
         }
         this.ownJars = jars;
+    }
+
+    /**
+     * Registers this loader before the plugin main class is instantiated,
+     * reusing the parent plugin's dependency-access policy.
+     */
+    void registerAccessBackedGroup() {
+        if (!(parent instanceof ConfiguredPluginClassLoader configured)) {
+            throw new IllegalStateException("FoliaAccess needs a configured parent plugin loader");
+        }
+        PluginClassLoaderGroup parentGroup = configured.getGroup();
+        if (parentGroup == null) {
+            throw new IllegalStateException("FoliaAccess parent plugin loader has no dependency group yet");
+        }
+        registerAccessBackedGroup(parentGroup.getAccess(), PaperClassLoaderStorage.instance());
+    }
+
+    /** Test seam; production uses the parent access policy and Paper singleton. */
+    void registerAccessBackedGroup(ClassLoaderAccess access, PaperClassLoaderStorage storage) {
+        synchronized (this) {
+            if (group == null) {
+                group = storage.registerAccessBackedGroup(this, access);
+            }
+        }
+    }
+
+    /** Undo an early registration if plugin construction fails. */
+    void unregisterFromPaper() {
+        if (group != null) unregisterFromPaper(PaperClassLoaderStorage.instance());
+    }
+
+    void unregisterFromPaper(PaperClassLoaderStorage storage) {
+        synchronized (this) {
+            if (group != null) {
+                storage.unregisterClassloader(this);
+                group = null;
+            }
+        }
     }
 
     @Override
@@ -137,22 +177,43 @@ final class AccessClassLoader extends URLClassLoader implements ConfiguredPlugin
         String resourceName = name.replace('.', '/') + ".class";
         URL ownResource = findResource(resourceName);
         if (ownResource == null) {
-            // Not bundled: let the parent and its plugin classloader group resolve it.
-            return parent.loadClass(name);
+            // Let the parent resolve it first, then use this loader's
+            // access-backed group if the parent cannot resolve it.
+            return loadFromParentOrGroup(name);
         }
         if (isInPluginJar(ownResource)) {
             // Plugin classes must come from this loader, not the parent's copy.
             return findClass(name);
         }
+
+        Class<?> parents = null;
         try {
-            Class<?> parents = parent.loadClass(name);
-            if (!fromOwnJars(parents, resourceName)) {
-                return parents;
-            }
+            parents = parent.loadClass(name);
         } catch (ClassNotFoundException ignored) {
-            // The parent does not have it; define our copy below.
+            // Try the access-backed group before defining our own library copy.
+        }
+        if (parents == null) parents = findInGroup(name);
+        if (parents != null) {
+            // A group lookup can resolve this class through this loader itself.
+            if (parents.getClassLoader() == this) return parents;
+            if (!fromOwnJars(parents, resourceName)) return parents;
         }
         return findClass(name);
+    }
+
+    private Class<?> loadFromParentOrGroup(String name) throws ClassNotFoundException {
+        try {
+            return parent.loadClass(name);
+        } catch (ClassNotFoundException parentMiss) {
+            Class<?> fromGroup = findInGroup(name);
+            if (fromGroup != null) return fromGroup;
+            throw parentMiss;
+        }
+    }
+
+    private Class<?> findInGroup(String name) {
+        PluginClassLoaderGroup currentGroup = group;
+        return currentGroup == null ? null : currentGroup.getClassByName(name, false, this);
     }
 
     private boolean isInPluginJar(URL resource) {
@@ -219,10 +280,9 @@ final class AccessClassLoader extends URLClassLoader implements ConfiguredPlugin
     // ------------------------------------------- ConfiguredPluginClassLoader
 
     /**
-     * The four-argument lookup Paper uses when one plugin reaches into another.
-     * This loader is not in the group, so in practice nothing calls this — but
-     * the interface requires it, and own-URLs-first is the right answer if it
-     * ever is.
+     * The four-argument lookup Paper uses when a plugin group asks this loader
+     * for a class. It only exposes this loader's own URLs; the requesting
+     * plugin's group is responsible for any further visibility.
      */
     @Override
     public Class<?> loadClass(String name, boolean resolve, boolean checkGlobal,
@@ -286,9 +346,11 @@ final class AccessClassLoader extends URLClassLoader implements ConfiguredPlugin
         return plugin;
     }
 
-    /** The parent's group — this loader is not registered anywhere itself. */
+    /** The registered group, or the parent plugin's group before registration. */
     @Override
     public PluginClassLoaderGroup getGroup() {
+        PluginClassLoaderGroup registered = group;
+        if (registered != null) return registered;
         return parent instanceof ConfiguredPluginClassLoader configured
                 ? configured.getGroup()
                 : null;

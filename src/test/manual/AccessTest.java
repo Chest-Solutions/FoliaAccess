@@ -5,6 +5,10 @@ import io.papermc.paper.plugin.configuration.PluginMeta;
 import io.papermc.paper.plugin.loader.PluginClasspathBuilder;
 import io.papermc.paper.plugin.loader.library.ClassPathLibrary;
 import io.papermc.paper.plugin.loader.library.LibraryStore;
+import io.papermc.paper.plugin.provider.classloader.ClassLoaderAccess;
+import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
+import io.papermc.paper.plugin.provider.classloader.PaperClassLoaderStorage;
+import io.papermc.paper.plugin.provider.classloader.PluginClassLoaderGroup;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -452,6 +456,54 @@ public class AccessTest {
         } catch (ClassNotFoundException expected) {
             check("unknown class still throws ClassNotFoundException", true);
         }
+
+        System.out.println("\nPaperClassLoaderStorage access-backed registration");
+        PluginClassLoaderGroup accessGroup = (PluginClassLoaderGroup) Proxy.newProxyInstance(
+                AccessTest.class.getClassLoader(), new Class<?>[]{PluginClassLoaderGroup.class},
+                (proxy, method, args1) -> switch (method.getName()) {
+                    case "toString" -> "access-group-test";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == args1[0];
+                    default -> null;
+                });
+        ClassLoaderAccess accessPolicy = (ClassLoaderAccess) Proxy.newProxyInstance(
+                AccessTest.class.getClassLoader(), new Class<?>[]{ClassLoaderAccess.class},
+                (proxy, method, args1) -> switch (method.getName()) {
+                    case "canAccess" -> true;
+                    case "toString" -> "parent-access-policy-test";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == args1[0];
+                    default -> null;
+                });
+        ConfiguredPluginClassLoader[] registered = new ConfiguredPluginClassLoader[1];
+        ConfiguredPluginClassLoader[] unregistered = new ConfiguredPluginClassLoader[1];
+        ClassLoaderAccess[] registeredPolicy = new ClassLoaderAccess[1];
+        PaperClassLoaderStorage storage = (PaperClassLoaderStorage) Proxy.newProxyInstance(
+                AccessTest.class.getClassLoader(), new Class<?>[]{PaperClassLoaderStorage.class},
+                (proxy, method, args1) -> switch (method.getName()) {
+                    case "registerAccessBackedGroup" -> {
+                        registered[0] = (ConfiguredPluginClassLoader) args1[0];
+                        registeredPolicy[0] = (ClassLoaderAccess) args1[1];
+                        yield accessGroup;
+                    }
+                    case "unregisterClassloader" -> {
+                        unregistered[0] = (ConfiguredPluginClassLoader) args1[0];
+                        yield null;
+                    }
+                    case "toString" -> "paper-storage-test";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == args1[0];
+                    default -> false;
+                });
+        AccessClassLoader groupLoader = new AccessClassLoader(new URL[0], parent,
+                fullMeta("GroupTest", "does.not.Exist"), pluginJar2);
+        groupLoader.registerAccessBackedGroup(accessPolicy, storage);
+        check("Paper storage receives this AccessClassLoader", registered[0] == groupLoader);
+        check("registration reuses the parent's access policy", registeredPolicy[0] == accessPolicy);
+        check("AccessClassLoader retains Paper's returned group", groupLoader.getGroup() == accessGroup);
+        groupLoader.unregisterFromPaper(storage);
+        check("cleanup unregisters this loader", unregistered[0] == groupLoader);
+        check("after unregister, parent group fallback is restored", groupLoader.getGroup() == null);
 
         System.out.println("\nstart() creates and initializes the plugin (end to end)");
         // A plugin main class, compiled against the real paper-api.
